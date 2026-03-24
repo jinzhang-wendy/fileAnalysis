@@ -1,7 +1,14 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import FlowChart from "../FlowChart/FlowChart";
 import { ragService } from "../../services/ragService";
 import { logger } from "../../services/logger";
+import { apiClient } from "../../services/apiClient";
+import { AppError, ErrorType, isCancelledError } from "../../utils/errors";
+import {
+  validateChatResponse,
+  validateFlowchartData,
+  extractAndValidateJson,
+} from "../../utils/validators";
 
 // 分析模式类型
 type AnalysisMode = 'flowchart' | 'summary' | 'structure' | 'auto';
@@ -14,6 +21,15 @@ interface RelevantChunk {
   chunkIndex: number;
 }
 
+// 对话消息类型（用于 UI 显示）
+interface UIMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  relevantChunks?: RelevantChunk[];
+  timestamp: number;
+}
+
 const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
   const [loading, setLoading] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<any>(null);
@@ -22,9 +38,13 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
     edges: any[];
   }>({ nodes: [], edges: [] });
   const [question, setQuestion] = useState('');
-  const [answer, setAnswer] = useState('');
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('auto');
   const [qaMode, setQaMode] = useState<QAMode>('rag');
+
+  // 对话历史（用于 UI 显示）
+  const [conversationMessages, setConversationMessages] = useState<UIMessage[]>([]);
+  // 是否启用记忆
+  const [useMemory, setUseMemory] = useState(true);
 
   // RAG 相关状态
   const [ragReady, setRagReady] = useState(false);
@@ -32,12 +52,17 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
   const [ragProgress, setRagProgress] = useState(0);
   const [ragStatus, setRagStatus] = useState('');
   const [chunkCount, setChunkCount] = useState(0);
-  const [relevantChunks, setRelevantChunks] = useState<RelevantChunk[]>([]);
 
   // 错误和日志状态
   const [error, setError] = useState<string | null>(null);
+  const [errorDetails, setErrorDetails] = useState<string[] | null>(null);
   const [showLogs, setShowLogs] = useState(false);
   const [apiReady, setApiReady] = useState(false);
+
+  // 取消控制器
+  const abortControllerRef = useRef<AbortController | null>(null);
+  // 对话历史滚动区域
+  const conversationEndRef = useRef<HTMLDivElement | null>(null);
 
   // 检查 API 配置
   useEffect(() => {
@@ -57,18 +82,67 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
     setRagReady(false);
     setRagProgress(0);
     setChunkCount(0);
-    setRelevantChunks([]);
     setError(null);
+    setErrorDetails(null);
     ragService.clear();
 
-    // 重置问答相关状态
-    setAnswer('');
+    // 重置对话历史
+    setConversationMessages([]);
     setQuestion('');
 
     // 重置分析结果
     setAnalysisResult(null);
     setFlowData({ nodes: [], edges: [] });
   }, [text]);
+
+  // 自动滚动到最新消息
+  useEffect(() => {
+    conversationEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [conversationMessages]);
+
+  // 取消当前操作
+  const handleCancel = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    ragService.abort();
+    setLoading(false);
+    setRagIndexing(false);
+    setError('操作已取消');
+    logger.info('DocAnalysis', '用户取消操作');
+  }, []);
+
+  // 处理错误
+  const handleError = useCallback((err: unknown, operation: string) => {
+    if (isCancelledError(err)) {
+      setError('操作已取消');
+      return;
+    }
+
+    if (err instanceof AppError) {
+      setError(`${operation}失败: ${err.userMessage}`);
+      setErrorDetails(err.solutions);
+    } else if (err instanceof Error) {
+      setError(`${operation}失败: ${err.message}`);
+      setErrorDetails(null);
+    } else {
+      setError(`${operation}失败: 未知错误`);
+      setErrorDetails(null);
+    }
+
+    logger.error('DocAnalysis', `${operation}失败`, err);
+  }, []);
+
+  // 组件卸载时清理
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      ragService.abort();
+    };
+  }, []);
 
   // 根据分析模式生成 prompt
   const getPromptByMode = (mode: AnalysisMode): string => {
@@ -167,85 +241,99 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
       return;
     }
 
+    // 创建新的 AbortController
+    abortControllerRef.current = new AbortController();
+
     setLoading(true);
     setError(null);
+    setErrorDetails(null);
     setAnalysisResult(null);
     setFlowData({ nodes: [], edges: [] });
 
     try {
       const prompt = getPromptByMode(analysisMode);
+      const apiKey = import.meta.env.VITE_DEEPSEEK_API_KEY;
 
-      const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      const data = await apiClient.request<unknown>({
+        url: 'https://api.deepseek.com/v1/chat/completions',
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${import.meta.env.VITE_DEEPSEEK_API_KEY}`,
+          'Authorization': `Bearer ${apiKey}`,
         },
-        body: JSON.stringify({
+        body: {
           model: 'deepseek-chat',
           messages: [
             { role: 'system', content: prompt },
             { role: 'user', content: text }
           ],
           temperature: 0.1,
-        }),
+        },
+        signal: abortControllerRef.current.signal,
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(`${response.status} ${errorData.message || errorData.error?.message || 'Unknown error'}`);
+      // 验证响应
+      const validationResult = validateChatResponse(data);
+      if (!validationResult.valid || validationResult.data === undefined) {
+        throw new AppError({
+          type: ErrorType.VALIDATION,
+          message: validationResult.error || 'API 响应验证失败',
+        });
       }
 
-      const data = await response.json();
-      const content = data.choices[0]?.message?.content;
-      if (!content) {
-        throw new Error('API返回的内容为空');
+      const content = validationResult.data;
+
+      // 提取 JSON
+      const result = extractAndValidateJson(content, (data) => ({ valid: true, data }));
+      if (!result.valid || !result.data) {
+        throw new AppError({
+          type: ErrorType.PARSE_ERROR,
+          message: '无法从返回内容中提取有效的 JSON 数据',
+        });
       }
 
-      setAnalysisResult(data);
-
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('无法从返回内容中提取JSON');
-      }
-
-      const resultJson = JSON.parse(jsonMatch[0]);
+      const resultJson = result.data as Record<string, unknown>;
 
       if (resultJson.error) {
-        setError(resultJson.error);
+        setError(String(resultJson.error));
         return;
       }
 
       const analysisData = analysisMode === 'auto' ? resultJson.result : resultJson;
 
-      if (analysisData.nodes && Array.isArray(analysisData.nodes)) {
-        const nodes = analysisData.nodes.map((node: any, index: number) => ({
-          id: node.id || `${index + 1}`,
-          type: node.type === 'start' ? 'input' :
-                node.type === 'end' ? 'output' :
-                node.type === 'decision' ? 'default' : 'default',
-          data: { label: node.label || `节点 ${index + 1}` },
-          position: node.position || { x: 100, y: index * 80 },
-        }));
+      // 验证并处理流程图数据
+      if (analysisData && typeof analysisData === 'object') {
+        const analysisObj = analysisData as Record<string, unknown>;
+        if (analysisObj.nodes && Array.isArray(analysisObj.nodes)) {
+          const flowResult = validateFlowchartData(analysisObj);
+          if (flowResult.valid && flowResult.data) {
+            const nodes = flowResult.data.nodes.map((node, index) => ({
+              id: node.id,
+              type: node.type === 'start' ? 'input' :
+                    node.type === 'end' ? 'output' :
+                    node.type === 'decision' ? 'default' : 'default',
+              data: { label: node.label || `节点 ${index + 1}` },
+              position: node.position || { x: 100, y: index * 80 },
+            }));
 
-        const edges = (analysisData.edges || []).map((edge: any, index: number) => ({
-          id: `e${index + 1}`,
-          source: edge.source,
-          target: edge.target,
-          label: edge.label || '',
-          type: 'smoothstep',
-        }));
+            const edges = flowResult.data.edges.map((edge, index) => ({
+              id: `e${index + 1}`,
+              source: edge.source,
+              target: edge.target,
+              label: edge.label || '',
+              type: 'smoothstep',
+            }));
 
-        setFlowData({ nodes, edges });
+            setFlowData({ nodes, edges });
+          }
+        }
       }
 
-      // 设置分析结果（智能识别模式需要展开 result）
+      // 设置分析结果
       if (analysisMode === 'auto' && resultJson.result) {
-        // 智能识别模式：将 result 的内容展开到顶层，同时保留 documentType 和 analysisType
         setAnalysisResult({
           documentType: resultJson.documentType,
           analysisType: resultJson.analysisType,
-          ...resultJson.result,
+          ...(resultJson.result as object),
           rawContent: content
         });
       } else {
@@ -256,10 +344,10 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
       }
 
     } catch (err: any) {
-      setError(`分析失败: ${err.message}`);
-      logger.error('DocAnalysis', '文档分析失败', err);
+      handleError(err, '文档分析');
     } finally {
       setLoading(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -270,10 +358,11 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
       return;
     }
 
-    // 检查 OpenAI API 配置
+    // 检查 API 配置
     const configCheck = ragService.checkApiConfig();
     if (!configCheck.valid) {
       setError(configCheck.message);
+      setErrorDetails(['请确保已在 .env.local 文件中配置 VITE_DEEPSEEK_API_KEY']);
       logger.error('DocAnalysis', 'API 配置检查失败', configCheck);
       return;
     }
@@ -282,7 +371,7 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
     setRagProgress(0);
     setRagStatus('初始化...');
     setError(null);
-    setRelevantChunks([]);
+    setErrorDetails(null);
 
     logger.info('DocAnalysis', '开始建立 RAG 索引');
 
@@ -319,9 +408,8 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
       });
 
     } catch (err: any) {
-      setError(`建立索引失败: ${err.message}`);
+      handleError(err, '建立索引');
       setRagStatus('索引失败');
-      logger.error('DocAnalysis', '建立 RAG 索引失败', err);
     } finally {
       setRagIndexing(false);
     }
@@ -334,61 +422,108 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
       return;
     }
 
+    // 创建新的 AbortController
+    abortControllerRef.current = new AbortController();
+
     setLoading(true);
     setError(null);
-    setAnswer('');
-    setRelevantChunks([]);
+    setErrorDetails(null);
+
+    // 先添加用户问题到对话历史
+    const userMessageId = `user_${Date.now()}`;
+    const assistantMessageId = `assistant_${Date.now()}`;
+
+    setConversationMessages(prev => [...prev, {
+      id: userMessageId,
+      role: 'user',
+      content: question,
+      timestamp: Date.now(),
+    }]);
+
+    // 临时存储相关段落
+    let retrievedChunks: RelevantChunk[] = [];
 
     try {
+      let answer: string;
+
       if (qaMode === 'rag' && ragReady) {
-        const result = await ragService.askQuestion(question, {
+        answer = await ragService.askQuestion(question, {
           topK: 3,
+          useMemory,  // 传递记忆开关
           onRetrieved: (chunks) => {
-            setRelevantChunks(
-              chunks.map((c) => ({
-                content: c.content,
-                chunkIndex: c.metadata?.chunkIndex || 0,
-              }))
-            );
+            retrievedChunks = chunks.map((c) => ({
+              content: c.content,
+              chunkIndex: c.metadata?.chunkIndex || 0,
+            }));
           },
         });
-        setAnswer(result);
       } else {
         if (!apiReady) {
           setError('DeepSeek API Key 未配置');
+          setErrorDetails(['请确保已在 .env.local 文件中配置 VITE_DEEPSEEK_API_KEY']);
+          // 移除用户消息
+          setConversationMessages(prev => prev.filter(m => m.id !== userMessageId));
           return;
         }
 
-        const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+        const apiKey = import.meta.env.VITE_DEEPSEEK_API_KEY;
+
+        const data = await apiClient.request<unknown>({
+          url: 'https://api.deepseek.com/v1/chat/completions',
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${import.meta.env.VITE_DEEPSEEK_API_KEY}`,
+            'Authorization': `Bearer ${apiKey}`,
           },
-          body: JSON.stringify({
+          body: {
             model: 'deepseek-chat',
             messages: [
               { role: 'system', content: '根据以下文档内容回答用户问题：' },
               { role: 'user', content: `文档内容：${text}\n\n问题：${question}` },
             ],
-          }),
+          },
+          signal: abortControllerRef.current.signal,
         });
 
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(`${response.status} ${errorData.message || 'Unknown error'}`);
+        // 验证响应
+        const validationResult = validateChatResponse(data);
+        if (!validationResult.valid || validationResult.data === undefined) {
+          throw new AppError({
+            type: ErrorType.VALIDATION,
+            message: validationResult.error || 'API 响应验证失败',
+          });
         }
 
-        const data = await response.json();
-        setAnswer(data.choices[0].message.content);
+        answer = validationResult.data;
       }
+
+      // 添加助手回答到对话历史
+      setConversationMessages(prev => [...prev, {
+        id: assistantMessageId,
+        role: 'assistant',
+        content: answer,
+        relevantChunks: retrievedChunks,
+        timestamp: Date.now(),
+      }]);
+
+      // 清空输入
+      setQuestion('');
+
     } catch (err: any) {
-      setError(`提问失败: ${err.message}`);
-      logger.error('DocAnalysis', '提问失败', err);
+      // 移除用户消息（如果失败）
+      setConversationMessages(prev => prev.filter(m => m.id !== userMessageId));
+      handleError(err, '提问');
     } finally {
       setLoading(false);
+      abortControllerRef.current = null;
     }
   };
+
+  // 清空对话历史
+  const clearConversation = useCallback(() => {
+    setConversationMessages([]);
+    ragService.clearConversationHistory();
+    logger.info('DocAnalysis', '对话历史已清空');
+  }, []);
 
   return (
     <div className="p-4 border rounded shadow-md">
@@ -417,10 +552,28 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
             <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
               <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
             </svg>
-            <div>
+            <div className="flex-1">
               <p className="font-medium">错误</p>
               <p>{error}</p>
+              {errorDetails && errorDetails.length > 0 && (
+                <ul className="mt-2 text-xs text-red-600 list-disc list-inside">
+                  {errorDetails.map((solution, i) => (
+                    <li key={i}>{solution}</li>
+                  ))}
+                </ul>
+              )}
             </div>
+            <button
+              onClick={() => {
+                setError(null);
+                setErrorDetails(null);
+              }}
+              className="text-red-400 hover:text-red-600"
+            >
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+              </svg>
+            </button>
           </div>
         </div>
       )}
@@ -475,13 +628,24 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
         </div>
       </div>
 
-      <button
-        onClick={analyzeDocument}
-        disabled={loading || !apiReady}
-        className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400 disabled:cursor-not-allowed"
-      >
-        {loading ? '分析中...' : '分析文档'}
-      </button>
+      <div className="flex gap-2 items-center">
+        <button
+          onClick={analyzeDocument}
+          disabled={loading || !apiReady}
+          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400 disabled:cursor-not-allowed"
+        >
+          {loading ? '分析中...' : '分析文档'}
+        </button>
+
+        {loading && (
+          <button
+            onClick={handleCancel}
+            className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
+          >
+            取消
+          </button>
+        )}
+      </div>
 
       {loading && (
         <div className="flex items-center text-blue-500 mt-4">
@@ -619,6 +783,14 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
             >
               {ragIndexing ? `索引中 ${ragProgress}%` : ragReady ? '重建索引' : '建立索引'}
             </button>
+            {ragIndexing && (
+              <button
+                onClick={handleCancel}
+                className="px-3 py-1.5 text-sm bg-red-500 text-white rounded hover:bg-red-600"
+              >
+                取消
+              </button>
+            )}
           </div>
         </div>
 
@@ -635,30 +807,118 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
           </div>
         )}
 
-        {/* 问答模式切换 */}
-        <div className="flex gap-2 mb-3">
-          <button
-            onClick={() => setQaMode('rag')}
-            disabled={!ragReady}
-            className={`px-3 py-1.5 text-sm rounded ${
-              qaMode === 'rag'
-                ? 'bg-purple-500 text-white'
-                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-            } ${!ragReady ? 'opacity-50 cursor-not-allowed' : ''}`}
-          >
-            RAG 模式 {!ragReady && '(需先建立索引)'}
-          </button>
-          <button
-            onClick={() => setQaMode('direct')}
-            className={`px-3 py-1.5 text-sm rounded ${
-              qaMode === 'direct'
-                ? 'bg-green-500 text-white'
-                : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-            }`}
-          >
-            直接问答
-          </button>
+        {/* 问答模式切换 & 记忆开关 */}
+        <div className="flex flex-wrap gap-2 mb-3 items-center">
+          <div className="flex gap-2">
+            <button
+              onClick={() => setQaMode('rag')}
+              disabled={!ragReady}
+              className={`px-3 py-1.5 text-sm rounded ${
+                qaMode === 'rag'
+                  ? 'bg-purple-500 text-white'
+                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+              } ${!ragReady ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              RAG 模式 {!ragReady && '(需先建立索引)'}
+            </button>
+            <button
+              onClick={() => setQaMode('direct')}
+              className={`px-3 py-1.5 text-sm rounded ${
+                qaMode === 'direct'
+                  ? 'bg-green-500 text-white'
+                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+              }`}
+            >
+              直接问答
+            </button>
+          </div>
+
+          {/* 记忆开关 */}
+          <div className="flex items-center gap-2 ml-auto">
+            <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useMemory}
+                onChange={(e) => setUseMemory(e.target.checked)}
+                className="w-4 h-4 text-purple-500 rounded"
+              />
+              <span>记忆对话</span>
+            </label>
+            {conversationMessages.length > 0 && (
+              <button
+                onClick={clearConversation}
+                className="text-xs text-red-500 hover:text-red-700"
+              >
+                清空对话
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* 对话历史 */}
+        {conversationMessages.length > 0 && (
+          <div className="mb-3 max-h-96 overflow-y-auto border rounded bg-gray-50">
+            <div className="p-3 space-y-3">
+              {conversationMessages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div
+                    className={`max-w-[85%] ${
+                      msg.role === 'user'
+                        ? 'bg-purple-500 text-white rounded-lg rounded-br-sm'
+                        : 'bg-white border rounded-lg rounded-bl-sm'
+                    } px-3 py-2`}
+                  >
+                    {/* 用户消息 */}
+                    {msg.role === 'user' && (
+                      <p className="text-sm">{msg.content}</p>
+                    )}
+
+                    {/* 助手消息 */}
+                    {msg.role === 'assistant' && (
+                      <div>
+                        {/* 相关段落 */}
+                        {msg.relevantChunks && msg.relevantChunks.length > 0 && (
+                          <div className="mb-2 pb-2 border-b border-gray-100">
+                            <p className="text-xs text-purple-600 font-medium mb-1">
+                              📚 检索到 {msg.relevantChunks.length} 个相关段落
+                            </p>
+                            <div className="space-y-1">
+                              {msg.relevantChunks.slice(0, 2).map((chunk, i) => (
+                                <p key={i} className="text-xs text-gray-500 line-clamp-2">
+                                  • {chunk.content.substring(0, 80)}...
+                                </p>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {/* 回答内容 */}
+                        <p className="text-sm text-gray-700 whitespace-pre-wrap">{msg.content}</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {/* 加载中指示 */}
+              {loading && conversationMessages.length > 0 && (
+                <div className="flex justify-start">
+                  <div className="bg-white border rounded-lg px-3 py-2">
+                    <div className="flex items-center gap-2 text-gray-500">
+                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      <span className="text-sm">思考中...</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+              <div ref={conversationEndRef} />
+            </div>
+          </div>
+        )}
 
         {/* 提问输入 */}
         <div className="flex gap-2">
@@ -666,43 +926,29 @@ const DocAnalysis: React.FC<{ text: string }> = ({ text }) => {
             type="text"
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && askQuestion()}
-            placeholder={qaMode === 'rag' ? '基于文档内容智能检索回答...' : '直接基于全文回答...'}
+            onKeyDown={(e) => e.key === 'Enter' && !loading && askQuestion()}
+            placeholder={
+              conversationMessages.length === 0
+                ? (qaMode === 'rag' ? '输入问题开始对话...' : '直接基于全文回答...')
+                : '继续提问...'
+            }
             className="flex-1 p-2 border rounded focus:outline-none focus:ring-2 focus:ring-purple-500"
+            disabled={loading}
           />
           <button
             onClick={askQuestion}
-            disabled={loading}
-            className="px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600 disabled:bg-gray-400"
+            disabled={loading || !question.trim()}
+            className="px-4 py-2 bg-purple-500 text-white rounded hover:bg-purple-600 disabled:bg-gray-400 disabled:cursor-not-allowed"
           >
-            {loading ? '回答中...' : '提问'}
+            {loading ? '...' : '发送'}
           </button>
         </div>
 
-        {/* 相关段落展示 */}
-        {relevantChunks.length > 0 && (
-          <div className="mt-4">
-            <h4 className="text-sm font-medium text-gray-600 mb-2">检索到的相关段落：</h4>
-            <div className="space-y-2">
-              {relevantChunks.map((chunk, i) => (
-                <div
-                  key={i}
-                  className="p-2 bg-purple-50 border border-purple-200 rounded text-sm"
-                >
-                  <span className="text-purple-600 font-medium">段落 {chunk.chunkIndex + 1}：</span>
-                  <p className="text-gray-700 mt-1 line-clamp-3">{chunk.content}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* 回答展示 */}
-        {answer && (
-          <div className="mt-4">
-            <h4 className="text-sm font-medium text-gray-600 mb-2">回答：</h4>
-            <p className="whitespace-pre-wrap bg-gray-100 p-3 rounded">{answer}</p>
-          </div>
+        {/* 提示 */}
+        {useMemory && conversationMessages.length > 0 && (
+          <p className="text-xs text-gray-400 mt-2">
+            💡 记忆已开启，助手会参考之前的对话上下文
+          </p>
         )}
       </div>
     </div>

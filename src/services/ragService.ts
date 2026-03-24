@@ -1,9 +1,25 @@
 import { createLogger } from './logger';
+import { ApiClient, createApiClient } from './apiClient';
+import { AppError, ErrorType, createAppError, isCancelledError } from '../utils/errors';
+import {
+  validateChatResponse,
+  validateEmbeddingResponse,
+} from '../utils/validators';
 
 const log = createLogger('RAGService');
 
 // DeepSeek API 配置
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1';
+
+// 对话消息类型
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+}
+
+// 短期记忆配置
+const SHORT_TERM_MEMORY_LIMIT = 6;  // 保留最近 3 轮对话（6 条消息）
 
 // 是否使用本地相似度计算（当 Embedding API 不可用时）
 let useLocalSimilarity = false;
@@ -154,6 +170,8 @@ export class RAGService {
   private splitter: SimpleTextSplitter;
   private apiKey: string;
   private vocabulary: Map<string, number> = new Map();
+  private apiClient: ApiClient;
+  private conversationHistory: ChatMessage[] = [];  // 短期记忆：对话历史
 
   constructor() {
     this.splitter = new SimpleTextSplitter({
@@ -161,6 +179,10 @@ export class RAGService {
       chunkOverlap: 100,
     });
     this.apiKey = import.meta.env.VITE_DEEPSEEK_API_KEY;
+    this.apiClient = createApiClient({
+      defaultTimeout: 30000,
+      maxRetries: 3,
+    });
     log.debug('RAGService 实例创建', {
       hasApiKey: !!this.apiKey,
       keyPrefix: this.apiKey ? this.apiKey.substring(0, 7) + '...' : 'none'
@@ -233,31 +255,26 @@ export class RAGService {
    */
   async testEmbeddingApi(): Promise<{ available: boolean; error?: string }> {
     try {
-      const response = await fetch(`${DEEPSEEK_API_URL}/embeddings`, {
+      const data = await this.apiClient.request<unknown>({
+        url: `${DEEPSEEK_API_URL}/embeddings`,
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.apiKey}`,
         },
-        body: JSON.stringify({
+        body: {
           model: 'deepseek-embed',
           input: 'test',
-        }),
+        },
+        timeout: 10000,  // 测试时使用较短超时
+        retries: 1,      // 测试时只重试一次
       });
 
-      const text = await response.text();
-
-      if (!response.ok) {
-        return { available: false, error: `HTTP ${response.status}: ${text.substring(0, 100)}` };
-      }
-
-      const data = JSON.parse(text);
-      if (!data.data || !data.data[0]?.embedding) {
-        return { available: false, error: '响应格式不符合预期' };
-      }
-
-      return { available: true };
+      const result = validateEmbeddingResponse(data);
+      return { available: result.valid };
     } catch (error: any) {
+      if (isCancelledError(error)) {
+        return { available: false, error: '测试已取消' };
+      }
       return { available: false, error: error.message };
     }
   }
@@ -265,107 +282,54 @@ export class RAGService {
   /**
    * 获取文本的向量嵌入 (DeepSeek API)
    */
-  async getEmbedding(text: string, retries = 3): Promise<number[]> {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        log.debug(`调用 DeepSeek Embedding API (尝试 ${attempt}/${retries})`, {
-          textLength: text.length,
-          preview: text.substring(0, 30) + '...',
+  async getEmbedding(text: string): Promise<number[]> {
+    log.debug('调用 DeepSeek Embedding API', {
+      textLength: text.length,
+      preview: text.substring(0, 30) + '...',
+    });
+
+    const startTime = Date.now();
+
+    try {
+      const data = await this.apiClient.request<unknown>({
+        url: `${DEEPSEEK_API_URL}/embeddings`,
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+        },
+        body: {
+          model: 'deepseek-embed',
+          input: text,
+        },
+      });
+
+      // 验证响应
+      const result = validateEmbeddingResponse(data);
+      if (!result.valid || !result.data) {
+        throw new AppError({
+          type: ErrorType.VALIDATION,
+          message: result.error || 'Embedding 响应验证失败',
         });
-
-        const startTime = Date.now();
-
-        const response = await fetch(`${DEEPSEEK_API_URL}/embeddings`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${this.apiKey}`,
-          },
-          body: JSON.stringify({
-            model: 'deepseek-embed',
-            input: text,
-          }),
-        });
-
-        // 先获取原始文本响应
-        const responseText = await response.text();
-        log.debug('API 原始响应', {
-          status: response.status,
-          statusText: response.statusText,
-          bodyLength: responseText.length,
-          bodyPreview: responseText.substring(0, 200),
-        });
-
-        if (!response.ok) {
-          // 尝试解析错误信息
-          let errorMsg = `HTTP ${response.status}`;
-          try {
-            const errorJson = JSON.parse(responseText);
-            errorMsg = errorJson.error?.message || errorJson.message || errorMsg;
-          } catch {
-            errorMsg = responseText.substring(0, 100) || errorMsg;
-          }
-          throw new Error(errorMsg);
-        }
-
-        // 解析 JSON
-        let data;
-        try {
-          data = JSON.parse(responseText);
-        } catch (parseError: any) {
-          log.error('JSON 解析失败', { responseText: responseText.substring(0, 500) });
-          throw new Error('API 返回了非 JSON 格式的响应');
-        }
-
-        // 检查数据结构
-        if (!data.data || !Array.isArray(data.data) || !data.data[0]?.embedding) {
-          log.error('API 响应结构异常', { data: JSON.stringify(data).substring(0, 500) });
-          throw new Error('API 响应结构不符合预期，可能 DeepSeek 不支持 embedding API');
-        }
-
-        const embedding = data.data[0].embedding;
-        const elapsed = Date.now() - startTime;
-
-        log.debug('DeepSeek Embedding API 调用成功', {
-          elapsedMs: elapsed,
-          embeddingDim: embedding.length,
-          model: data.model,
-        });
-
-        return embedding;
-
-      } catch (error: any) {
-        const errorInfo = {
-          message: error.message,
-          attempt,
-          retries,
-        };
-
-        log.error(`DeepSeek Embedding API 调用失败`, errorInfo);
-
-        // 特定错误处理
-        if (error.message?.includes('401') || error.message?.includes('Unauthorized')) {
-          throw new Error('DeepSeek API Key 无效，请检查配置');
-        }
-        if (error.message?.includes('404')) {
-          throw new Error('DeepSeek Embedding API 不存在，该服务可能不支持 embedding 功能');
-        }
-        if (error.message?.includes('429') || error.message?.includes('Rate limit')) {
-          log.warn('API 限流，等待重试...');
-          await this.sleep(1000 * attempt);
-          continue;
-        }
-
-        // 最后一次尝试失败
-        if (attempt === retries) {
-          throw new Error(`Embedding API 调用失败: ${error.message}`);
-        }
-
-        await this.sleep(500 * attempt);
       }
-    }
 
-    throw new Error('Embedding API 调用失败，已达最大重试次数');
+      const embedding = result.data;
+      const elapsed = Date.now() - startTime;
+
+      log.debug('DeepSeek Embedding API 调用成功', {
+        elapsedMs: elapsed,
+        embeddingDim: embedding.length,
+      });
+
+      return embedding;
+
+    } catch (error: any) {
+      if (isCancelledError(error)) {
+        throw error;  // 取消错误直接抛出
+      }
+
+      log.error('DeepSeek Embedding API 调用失败', { error: error.message });
+      throw createAppError(error);
+    }
   }
 
   /**
@@ -512,80 +476,149 @@ export class RAGService {
   }
 
   /**
-   * RAG 问答 (使用 DeepSeek Chat API)
+   * RAG 问答 (长短记忆联动)
+   * - 长期记忆：RAG 检索文档相关内容
+   * - 短期记忆：最近对话历史
    */
   async askQuestion(
     question: string,
     options?: {
       topK?: number;
       onRetrieved?: (chunks: DocumentChunk[]) => void;
+      useMemory?: boolean;  // 是否使用对话记忆
     }
   ): Promise<string> {
-    log.info('RAG 问答', { question, topK: options?.topK || 3 });
+    log.info('RAG 问答', { question, topK: options?.topK || 3, useMemory: options?.useMemory !== false });
 
+    // 1. 长期记忆：RAG 检索相关文档
     const relevantChunks = await this.similaritySearch(question, options?.topK || 3);
     options?.onRetrieved?.(relevantChunks);
 
-    const context = relevantChunks
-      .map((chunk, i) => `[相关段落 ${i + 1}]\n${chunk.content}`)
+    const longTermContext = relevantChunks
+      .map((chunk, i) => `[文档段落 ${i + 1}]\n${chunk.content}`)
       .join('\n\n');
 
-    log.debug('构建的上下文', { contextLength: context.length });
+    log.debug('长期记忆（RAG 检索）', { chunkCount: relevantChunks.length, contextLength: longTermContext.length });
+
+    // 2. 构建消息列表
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content: `你是一个智能文档分析助手。你需要结合文档知识（长期记忆）和对话历史（短期记忆）来回答用户问题。
+
+回答原则：
+1. 优先使用【文档知识】中的信息回答
+2. 如果文档中没有相关信息，可以参考【对话历史】中的内容
+3. 如果都没有相关信息，请明确说明"根据当前文档，我无法回答这个问题"
+4. 回答要简洁准确，可以适当引用原文
+5. 如果用户追问，要结合之前的对话上下文理解意图`,
+      },
+    ];
+
+    // 3. 添加短期记忆（对话历史）
+    if (options?.useMemory !== false && this.conversationHistory.length > 0) {
+      messages.push({
+        role: 'user',
+        content: `【对话历史 - 短期记忆】
+以下是我们的对话记录，请参考上下文理解我的问题：
+
+${this.conversationHistory.map(msg =>
+  msg.role === 'user' ? `用户: ${msg.content}` : `助手: ${msg.content}`
+).join('\n\n')}`,
+      });
+    }
+
+    // 4. 添加当前问题和文档知识
+    messages.push({
+      role: 'user',
+      content: `【文档知识 - 长期记忆】
+${longTermContext}
+
+【当前问题】
+${question}`,
+    });
+
+    log.debug('消息列表构建完成', { messageCount: messages.length });
 
     try {
-      const response = await fetch(`${DEEPSEEK_API_URL}/chat/completions`, {
+      const data = await this.apiClient.request<unknown>({
+        url: `${DEEPSEEK_API_URL}/chat/completions`,
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.apiKey}`,
         },
-        body: JSON.stringify({
+        body: {
           model: 'deepseek-chat',
-          messages: [
-            {
-              role: 'system',
-              content: `你是一个文档分析助手。请根据提供的上下文内容回答用户问题。
-要求：
-1. 优先使用上下文中的信息回答
-2. 如果上下文中没有相关信息，请明确说明
-3. 回答要简洁准确
-4. 可以适当引用原文`,
-            },
-            {
-              role: 'user',
-              content: `上下文：
-${context}
-
-问题：${question}`,
-            },
-          ],
+          messages,
           temperature: 0.3,
-        }),
+        },
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(`API Error: ${errorData.error?.message || response.status}`);
+      // 验证响应
+      const result = validateChatResponse(data);
+      if (!result.valid || result.data === undefined) {
+        throw new AppError({
+          type: ErrorType.VALIDATION,
+          message: result.error || 'Chat 响应验证失败',
+        });
       }
 
-      const data = await response.json();
-      const answer = data.choices[0].message.content || '无法生成回答';
+      const answer = result.data || '无法生成回答';
 
-      log.info('RAG 问答完成', { answerLength: answer.length });
+      // 5. 更新对话历史（短期记忆）
+      if (options?.useMemory !== false) {
+        this.addToConversationHistory('user', question);
+        this.addToConversationHistory('assistant', answer);
+      }
+
+      log.info('RAG 问答完成', { answerLength: answer.length, historyLength: this.conversationHistory.length });
 
       return answer;
 
     } catch (error: any) {
+      if (isCancelledError(error)) {
+        throw error;
+      }
+
       log.error('RAG 问答失败', error);
-      throw new Error(`问答生成失败: ${error.message}`);
+      throw createAppError(error);
     }
   }
 
   /**
-   * 辅助函数：延迟
+   * 添加消息到对话历史（短期记忆）
    */
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  private addToConversationHistory(role: 'user' | 'assistant', content: string): void {
+    this.conversationHistory.push({
+      role,
+      content,
+      timestamp: Date.now(),
+    });
+
+    // 保持对话历史在限制内
+    while (this.conversationHistory.length > SHORT_TERM_MEMORY_LIMIT) {
+      this.conversationHistory.shift();
+    }
+
+    log.debug('对话历史更新', {
+      total: this.conversationHistory.length,
+      limit: SHORT_TERM_MEMORY_LIMIT
+    });
+  }
+
+  /**
+   * 获取对话历史
+   */
+  getConversationHistory(): ChatMessage[] {
+    return [...this.conversationHistory];
+  }
+
+  /**
+   * 清空对话历史
+   */
+  clearConversationHistory(): void {
+    this.conversationHistory = [];
+    log.info('对话历史已清空');
   }
 
   getChunkCount(): number {
@@ -597,12 +630,21 @@ ${context}
   }
 
   clear(): void {
-    log.debug('清空文档块');
+    log.debug('清空文档块和对话历史');
     this.chunks = [];
+    this.conversationHistory = [];
   }
 
   hasDocument(): boolean {
     return this.chunks.length > 0;
+  }
+
+  /**
+   * 取消所有正在进行的 API 请求
+   */
+  abort(): void {
+    log.info('取消所有 API 请求');
+    this.apiClient.abort();
   }
 }
 
