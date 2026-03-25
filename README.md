@@ -164,7 +164,7 @@ npm -v
 
 ```bash
 # 方式一：使用 Git（推荐）
-git clone https://github.com/your-username/ai-doc-analyzer.git
+git clone https://github.com/jinzhang-wendy/ai-doc-analyzer.git
 cd ai-doc-analyzer
 
 # 方式二：直接下载 ZIP
@@ -565,8 +565,8 @@ const DEFAULT_CONFIG: CacheConfig = {
 ## 📮 联系方式
 
 如有问题或建议，欢迎：
-- 提交 [Issue](https://github.com/your-username/ai-doc-analyzer/issues)
-- 发送邮件至 your-email@example.com
+- 提交 [Issue](https://github.com/jinzhang-wendy/ai-doc-analyzer/issues)
+- 发送邮件至 18257165113@163.com
 
 ---
 
