@@ -5,6 +5,15 @@ import {
   validateChatResponse,
   validateEmbeddingResponse,
 } from '../utils/validators';
+import { requestQueue } from './requestQueue';
+import { cacheService, CacheService } from './cacheService';
+import { parallelLimit, ProgressReporter, processInChunks } from './asyncProcessor';
+import {
+  contextManager,
+  ContextManager,
+  estimateTokens,
+  countMessagesTokens,
+} from './contextManager';
 
 const log = createLogger('RAGService');
 
@@ -20,6 +29,9 @@ export interface ChatMessage {
 
 // 短期记忆配置
 const SHORT_TERM_MEMORY_LIMIT = 6;  // 保留最近 3 轮对话（6 条消息）
+
+// 并发配置
+const MAX_CONCURRENT_EMBEDDINGS = 3;  // 同时处理的 embedding 请求数
 
 // 是否使用本地相似度计算（当 Embedding API 不可用时）
 let useLocalSimilarity = false;
@@ -333,7 +345,7 @@ export class RAGService {
   }
 
   /**
-   * 为所有文档块生成向量嵌入
+   * 为所有文档块生成向量嵌入（带并发控制和缓存）
    */
   async embedChunks(
     onProgress?: (progress: number, status: string) => void
@@ -341,6 +353,8 @@ export class RAGService {
     const total = this.chunks.length;
 
     log.info('开始生成向量嵌入', { totalChunks: total });
+
+    const progressReporter = new ProgressReporter(200);
 
     // 先测试 API 是否可用
     if (!useLocalSimilarity) {
@@ -360,13 +374,25 @@ export class RAGService {
       log.info('使用本地相似度计算模式');
       onProgress?.(10, '使用本地模式生成向量...');
 
-      for (let i = 0; i < this.chunks.length; i++) {
-        const chunk = this.chunks[i];
-        chunk.embedding = textToVector(chunk.content, this.vocabulary);
+      // 使用分片处理，避免阻塞 UI
+      await processInChunks(this.chunks, async (chunk, index) => {
+        // 检查缓存
+        const cacheKey = await CacheService.embeddingKey(chunk.content);
+        const cached = cacheService.get<number[]>(cacheKey);
 
-        const progress = Math.round(((i + 1) / total) * 100);
-        onProgress?.(10 + Math.round(progress * 0.9), `本地模式: ${i + 1}/${total}`);
-      }
+        if (cached) {
+          chunk.embedding = cached;
+          log.debug('使用缓存的向量', { chunkId: chunk.id });
+        } else {
+          chunk.embedding = textToVector(chunk.content, this.vocabulary);
+          // 缓存结果
+          cacheService.set(cacheKey, chunk.embedding);
+        }
+
+        progressReporter.report(index + 1, total, (progress, status) => {
+          onProgress?.(10 + Math.round(progress * 0.9), `本地模式: ${status}`);
+        });
+      }, { chunkSize: 5 });
 
       log.info('本地向量化完成', { totalChunks: total });
       return {
@@ -375,46 +401,80 @@ export class RAGService {
       };
     }
 
-    // 使用 API embedding
-    for (let i = 0; i < this.chunks.length; i++) {
-      const chunk = this.chunks[i];
-      const status = `API 模式: 处理第 ${i + 1}/${total} 块...`;
+    // 使用 API embedding（带并发控制和请求队列）
+    log.info('使用 API embedding 模式', {
+      maxConcurrent: MAX_CONCURRENT_EMBEDDINGS,
+    });
 
-      log.debug(`处理文档块 ${i + 1}/${total}`, {
-        chunkId: chunk.id,
-        contentLength: chunk.content.length,
-      });
+    let failed = false;
+    let completed = 0;
 
-      onProgress?.(
-        Math.round(((i + 1) / total) * 100),
-        status
+    try {
+      await parallelLimit(
+        this.chunks,
+        MAX_CONCURRENT_EMBEDDINGS,
+        async (chunk) => {
+          if (failed) return null;
+
+          // 检查缓存
+          const cacheKey = await CacheService.embeddingKey(chunk.content);
+          const cached = cacheService.get<number[]>(cacheKey);
+
+          if (cached) {
+            chunk.embedding = cached;
+            log.debug('使用缓存的向量', { chunkId: chunk.id });
+            completed++;
+            progressReporter.report(completed, total, (progress, status) => {
+              onProgress?.(10 + Math.round(progress * 0.9), `API 模式: ${status}`);
+            });
+            return cached;
+          }
+
+          // 通过请求队列发送请求
+          const embedding = await requestQueue.add(
+            () => this.getEmbedding(chunk.content),
+            { priority: 0 }
+          );
+
+          chunk.embedding = embedding;
+          completed++;
+
+          // 缓存结果
+          cacheService.set(cacheKey, embedding);
+
+          progressReporter.report(completed, total, (progress, status) => {
+            onProgress?.(10 + Math.round(progress * 0.9), `API 模式: ${status}`);
+          });
+
+          return embedding;
+        },
+        {
+          onItemComplete: (_chunk, index, _result) => {
+            log.debug(`文档块 ${index + 1}/${total} 完成`);
+          },
+        }
       );
 
-      try {
-        if (!chunk.embedding) {
-          chunk.embedding = await this.getEmbedding(chunk.content);
-        }
-      } catch (error: any) {
-        log.error(`文档块 ${chunk.id} 向量化失败，切换到本地模式`, error);
-        useLocalSimilarity = true;
+      log.info('所有文档块向量化完成', { totalChunks: total });
+      return {
+        mode: 'api',
+        message: '使用 DeepSeek Embedding API'
+      };
 
-        // 重新用本地模式处理所有块
-        for (const c of this.chunks) {
-          c.embedding = textToVector(c.content, this.vocabulary);
-        }
+    } catch (error: any) {
+      log.error('API embedding 失败，切换到本地模式', error);
+      useLocalSimilarity = true;
 
-        return {
-          mode: 'local',
-          message: 'API 失败，已切换到本地相似度计算'
-        };
+      // 用本地模式处理
+      for (const chunk of this.chunks) {
+        chunk.embedding = textToVector(chunk.content, this.vocabulary);
       }
-    }
 
-    log.info('所有文档块向量化完成', { totalChunks: total });
-    return {
-      mode: 'api',
-      message: '使用 DeepSeek Embedding API'
-    };
+      return {
+        mode: 'local',
+        message: 'API 失败，已切换到本地相似度计算'
+      };
+    }
   }
 
   /**
@@ -476,83 +536,150 @@ export class RAGService {
   }
 
   /**
-   * RAG 问答 (长短记忆联动)
+   * RAG 问答 (长短记忆联动 + 降级策略 + 成本控制)
    * - 长期记忆：RAG 检索文档相关内容
    * - 短期记忆：最近对话历史
+   * - 降级策略：根据系统状态自动降级
    */
   async askQuestion(
     question: string,
     options?: {
       topK?: number;
       onRetrieved?: (chunks: DocumentChunk[]) => void;
-      useMemory?: boolean;  // 是否使用对话记忆
+      useMemory?: boolean;
+      userId?: string;
     }
   ): Promise<string> {
-    log.info('RAG 问答', { question, topK: options?.topK || 3, useMemory: options?.useMemory !== false });
+    const startTime = Date.now();
 
-    // 1. 长期记忆：RAG 检索相关文档
-    const relevantChunks = await this.similaritySearch(question, options?.topK || 3);
-    options?.onRetrieved?.(relevantChunks);
+    // 1. 权限校验
+    const permissionChecker = contextManager.getPermissionChecker();
+    const requestCheck = options?.userId
+      ? permissionChecker.checkAndRecordRequest(options.userId)
+      : { allowed: true, remaining: 999 };
+
+    if (!requestCheck.allowed) {
+      throw new AppError({
+        type: ErrorType.API_ERROR,
+        message: '今日请求次数已达上限',
+        retryable: false,
+      });
+    }
+
+    // 2. 获取降级配置
+    const degradationConfig = contextManager.getDegradationConfig();
+    log.info('RAG 问答', {
+      question: question.substring(0, 50),
+      topK: options?.topK || 3,
+      useMemory: options?.useMemory !== false,
+      degradationLevel: contextManager.getDegradationLevel(),
+      remainingRequests: requestCheck.remaining,
+    });
+
+    // 3. 长期记忆：RAG 检索相关文档
+    let relevantChunks: DocumentChunk[] = [];
+
+    if (!degradationConfig.skipEmbedding) {
+      relevantChunks = await this.similaritySearch(question, options?.topK || 3);
+      options?.onRetrieved?.(relevantChunks);
+    } else {
+      // 降级：使用简单的关键词匹配
+      relevantChunks = this.simpleKeywordSearch(question, options?.topK || 3);
+      log.warn('使用降级模式：关键词匹配替代向量检索');
+    }
 
     const longTermContext = relevantChunks
       .map((chunk, i) => `[文档段落 ${i + 1}]\n${chunk.content}`)
       .join('\n\n');
 
-    log.debug('长期记忆（RAG 检索）', { chunkCount: relevantChunks.length, contextLength: longTermContext.length });
+    // 4. 根据降级级别调整上下文
+    let contextTokens = estimateTokens(longTermContext);
 
-    // 2. 构建消息列表
-    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-      {
-        role: 'system',
-        content: `你是一个智能文档分析助手。你需要结合文档知识（长期记忆）和对话历史（短期记忆）来回答用户问题。
-
-回答原则：
-1. 优先使用【文档知识】中的信息回答
-2. 如果文档中没有相关信息，可以参考【对话历史】中的内容
-3. 如果都没有相关信息，请明确说明"根据当前文档，我无法回答这个问题"
-4. 回答要简洁准确，可以适当引用原文
-5. 如果用户追问，要结合之前的对话上下文理解意图`,
-      },
-    ];
-
-    // 3. 添加短期记忆（对话历史）
-    if (options?.useMemory !== false && this.conversationHistory.length > 0) {
-      messages.push({
-        role: 'user',
-        content: `【对话历史 - 短期记忆】
-以下是我们的对话记录，请参考上下文理解我的问题：
-
-${this.conversationHistory.map(msg =>
-  msg.role === 'user' ? `用户: ${msg.content}` : `助手: ${msg.content}`
-).join('\n\n')}`,
+    // 如果超出降级配置的限制，截断上下文
+    let finalContext = longTermContext;
+    if (contextTokens > degradationConfig.maxTokens * 0.5) {
+      // 保留最重要的部分
+      const maxChars = Math.floor(degradationConfig.maxTokens * 0.5 * 4);
+      finalContext = longTermContext.substring(0, maxChars) + '\n...[上下文已截断]';
+      contextTokens = estimateTokens(finalContext);
+      log.warn('上下文已截断', {
+        originalTokens: estimateTokens(longTermContext),
+        truncatedTokens: contextTokens,
+        maxTokens: degradationConfig.maxTokens,
       });
     }
 
-    // 4. 添加当前问题和文档知识
-    messages.push({
-      role: 'user',
-      content: `【文档知识 - 长期记忆】
-${longTermContext}
+    // 5. 构建消息列表
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [];
 
-【当前问题】
-${question}`,
+    // 系统提示（根据降级级别调整）
+    const systemPrompt = this.getSystemPrompt(degradationConfig.responseMode);
+    messages.push({ role: 'system', content: systemPrompt });
+
+    // 6. 获取上下文管理器管理的对话历史
+    if (options?.useMemory !== false) {
+      const contextResult = await contextManager.getContextForAPI(question, {
+        maxTokens: Math.floor(degradationConfig.maxTokens * 0.3),
+        includeCore: true,
+      });
+
+      // 添加对话历史
+      for (const msg of contextResult.messages) {
+        messages.push({
+          role: msg.role as 'system' | 'user' | 'assistant',
+          content: msg.content,
+        });
+      }
+
+      log.debug('上下文管理器消息', {
+        historyItems: contextResult.stats.memoryItems,
+        compressedItems: contextResult.stats.compressedItems,
+        truncated: contextResult.stats.truncated,
+      });
+    }
+
+    // 7. 添加当前问题和文档知识
+    const userPrompt = degradationConfig.responseMode === 'minimal'
+      ? `文档: ${finalContext.substring(0, 500)}\n\n问: ${question}\n\n简短回答:`
+      : `【文档知识 - 长期记忆】\n${finalContext}\n\n【当前问题】\n${question}`;
+
+    messages.push({ role: 'user', content: userPrompt });
+
+    // 8. 检查总 Token 数
+    const totalTokens = countMessagesTokens(messages);
+    const tokenCheck = permissionChecker.checkTokenLimit(totalTokens);
+
+    if (!tokenCheck.allowed) {
+      // 进一步压缩
+      while (messages.length > 3 && countMessagesTokens(messages) > permissionChecker.getLimits().maxTokensPerRequest) {
+        messages.splice(2, 1);  // 移除最早的对话
+      }
+      log.warn('Token 超限，已压缩消息列表');
+    }
+
+    log.debug('消息列表构建完成', {
+      messageCount: messages.length,
+      estimatedTokens: totalTokens,
     });
 
-    log.debug('消息列表构建完成', { messageCount: messages.length });
-
     try {
-      const data = await this.apiClient.request<unknown>({
-        url: `${DEEPSEEK_API_URL}/chat/completions`,
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-        },
-        body: {
-          model: 'deepseek-chat',
-          messages,
-          temperature: 0.3,
-        },
-      });
+      // 9. 通过请求队列发送请求
+      const data = await requestQueue.add(
+        () => this.apiClient.request<unknown>({
+          url: `${DEEPSEEK_API_URL}/chat/completions`,
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+          },
+          body: {
+            model: 'deepseek-chat',
+            messages,
+            temperature: degradationConfig.responseMode === 'minimal' ? 0.1 : 0.3,
+            max_tokens: degradationConfig.responseMode === 'full' ? 2000 : 500,
+          },
+        }),
+        { priority: permissionChecker.getUserLevel() === 'premium' ? 10 : 0 }
+      );
 
       // 验证响应
       const result = validateChatResponse(data);
@@ -565,13 +692,39 @@ ${question}`,
 
       const answer = result.data || '无法生成回答';
 
-      // 5. 更新对话历史（短期记忆）
+      // 10. 记录使用情况
+      const responseTokens = estimateTokens(answer);
+      contextManager.recordUsage(totalTokens, responseTokens);
+
+      // 11. 更新对话历史（短期记忆）
       if (options?.useMemory !== false) {
+        // 旧方式
         this.addToConversationHistory('user', question);
         this.addToConversationHistory('assistant', answer);
+
+        // 新方式：使用上下文管理器
+        await contextManager.addMessage('user', question, {
+          importance: 0.7,
+        });
+        await contextManager.addMessage('assistant', answer, {
+          importance: 0.5,
+        });
       }
 
-      log.info('RAG 问答完成', { answerLength: answer.length, historyLength: this.conversationHistory.length });
+      // 12. 记录指标
+      const metrics = contextManager.getMetrics();
+      metrics.recordMetric('latency', Date.now() - startTime);
+      metrics.recordMetric('question_tokens', estimateTokens(question));
+      metrics.recordMetric('answer_tokens', responseTokens);
+
+      log.info('RAG 问答完成', {
+        answerLength: answer.length,
+        latencyMs: Date.now() - startTime,
+        tokensUsed: totalTokens + responseTokens,
+        degradationLevel: contextManager.getDegradationLevel(),
+      });
+
+      return answer;
 
       return answer;
 
@@ -618,7 +771,71 @@ ${question}`,
    */
   clearConversationHistory(): void {
     this.conversationHistory = [];
+    contextManager.clearMemory();
     log.info('对话历史已清空');
+  }
+
+  /**
+   * 根据响应模式获取系统提示
+   */
+  private getSystemPrompt(mode: 'full' | 'brief' | 'minimal'): string {
+    const basePrompt = '你是一个智能文档分析助手。';
+
+    const prompts: Record<typeof mode, string> = {
+      full: `${basePrompt}你需要结合文档知识（长期记忆）和对话历史（短期记忆）来回答用户问题。
+
+回答原则：
+1. 优先使用【文档知识】中的信息回答
+2. 如果文档中没有相关信息，可以参考【对话历史】中的内容
+3. 如果都没有相关信息，请明确说明"根据当前文档，我无法回答这个问题"
+4. 回答要简洁准确，可以适当引用原文
+5. 如果用户追问，要结合之前的对话上下文理解意图`,
+
+      brief: `${basePrompt}根据文档内容简要回答问题。保持回答简洁，不超过100字。如果文档中没有相关信息，请直接说明。`,
+
+      minimal: `${basePrompt}简短回答。`,
+    };
+
+    return prompts[mode];
+  }
+
+  /**
+   * 简单关键词搜索（降级时使用）
+   */
+  private simpleKeywordSearch(query: string, topK: number): DocumentChunk[] {
+    const keywords = query.toLowerCase()
+      .replace(/[^\w\u4e00-\u9fa5]/g, ' ')
+      .split(/\s+/)
+      .filter(k => k.length > 1);
+
+    if (keywords.length === 0) {
+      return this.chunks.slice(0, topK);
+    }
+
+    // 计算每个块的关键词匹配分数
+    const scores = this.chunks.map(chunk => {
+      const content = chunk.content.toLowerCase();
+      let score = 0;
+
+      for (const keyword of keywords) {
+        const matches = (content.match(new RegExp(keyword, 'g')) || []).length;
+        score += matches;
+      }
+
+      return { chunk, score };
+    });
+
+    // 按分数排序
+    scores.sort((a, b) => b.score - a.score);
+
+    return scores.slice(0, topK).map(s => s.chunk);
+  }
+
+  /**
+   * 获取上下文管理器（用于高级操作）
+   */
+  getContextManager(): ContextManager {
+    return contextManager;
   }
 
   getChunkCount(): number {

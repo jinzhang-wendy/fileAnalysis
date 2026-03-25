@@ -94,6 +94,43 @@ AI：根据之前提到的保修期和文档第 5 页的售后流程，您需要
 - **随时取消**：点击"取消"按钮中断正在进行的操作
 - **友好提示**：错误发生时告诉你具体原因和解决方法
 
+### 5. ⚡ 性能优化特性
+
+#### 智能缓存
+- 文档解析结果自动缓存，相同文档无需重复处理
+- 向量嵌入数据缓存，节省 API 调用和时间
+- 缓存自动过期清理（默认 24 小时）
+
+#### 请求队列管理
+- 自动控制并发请求数量，避免触发 API 限流
+- 速率限制保护（每分钟最多 30 个请求）
+- 请求优先级排序，重要请求优先处理
+
+#### 异步处理
+- 大型任务分片执行，界面始终保持响应
+- 实时进度报告，清晰了解处理状态
+- 支持随时取消正在进行的任务
+
+### 6. 💰 成本控制
+
+#### Token 使用统计
+- 实时记录每次 API 调用的 Token 消耗
+- 精确估算中英文内容的 Token 数量
+- 成本实时计算（支持 DeepSeek 定价）
+
+#### 权限与限额
+| 用户级别 | 每次最大 Token | 每日请求限制 | 单文件大小限制 |
+|---------|---------------|-------------|---------------|
+| Guest | 2,000 | 10 | 1 MB |
+| User | 4,000 | 100 | 5 MB |
+| Premium | 8,000 | 500 | 20 MB |
+| Admin | 16,000 | 无限制 | 100 MB |
+
+#### 预算保护
+- 设置每日预算限制（默认 $10/天）
+- 接近预算时自动告警
+- 超出预算自动降级，避免超支
+
 ---
 
 ## 🚀 快速开始
@@ -336,6 +373,29 @@ RAG（Retrieval-Augmented Generation，检索增强生成）是一种让 AI "记
 3. 把相关段落和问题一起发给 AI
 4. AI 基于文档内容回答，答案更准确
 
+### 长短记忆联动系统
+
+我们实现了仿人类的记忆管理系统：
+
+| 记忆层级 | 类比人类 | 在工具中 | 保留策略 |
+|---------|---------|---------|---------|
+| **核心记忆** | 永远记住的知识 | 重要对话、关键信息 | 永久保留（30% 容量） |
+| **近期记忆** | 刚才说的话 | 最近几轮对话 | 按时间排序，满了才压缩 |
+| **压缩记忆** | 大概印象 | 对话摘要 | 保留首尾，中间压缩 |
+| **丢弃记忆** | 忘记的内容 | 不重要的信息 | 超出容量时丢弃 |
+
+### 智能降级策略
+
+当系统遇到压力时，会自动降级以保证基本服务：
+
+| 降级级别 | 触发条件 | 系统行为 |
+|---------|---------|---------|
+| **Normal** | 正常运行 | 完整功能，无限制 |
+| **Light** | 接近预算限制 | 减少 30% Token 使用 |
+| **Medium** | 错误率 > 10% | 跳过向量检索，使用关键词匹配 |
+| **Heavy** | 错误率 > 30% | 仅使用缓存，简化回答 |
+| **Minimal** | 超出预算 | 最小化服务，简短回答 |
+
 ### 项目架构
 
 ```
@@ -347,9 +407,13 @@ ai-doc-analyzer/
 │   │   └── FlowChart/       # 流程图展示
 │   │
 │   ├── services/            # 核心服务
-│   │   ├── ragService.ts    # RAG 智能问答引擎
-│   │   ├── apiClient.ts     # API 请求处理
-│   │   └── logger.ts        # 日志记录
+│   │   ├── ragService.ts       # RAG 智能问答引擎
+│   │   ├── apiClient.ts        # API 请求处理
+│   │   ├── cacheService.ts     # 本地缓存服务
+│   │   ├── contextManager.ts   # 上下文管理（记忆+权限+降级）
+│   │   ├── requestQueue.ts     # 请求队列管理
+│   │   ├── asyncProcessor.ts   # 异步处理器
+│   │   └── logger.ts           # 日志记录
 │   │
 │   └── utils/               # 工具函数
 │       ├── documentParser.ts # 文档解析器
@@ -373,6 +437,33 @@ ai-doc-analyzer/
 | SheetJS | Excel 文件解析 |
 | DeepSeek API | AI 智能服务 |
 
+### 核心服务说明
+
+#### 1. 缓存服务 (cacheService.ts)
+- 自动缓存文档解析结果，避免重复处理
+- 缓存向量嵌入数据，节省 API 调用
+- 支持过期清理和存储空间管理（最大 50MB）
+- 使用 localStorage 持久化存储
+
+#### 2. 上下文管理器 (contextManager.ts)
+- **记忆管理**：分级存储对话历史，智能压缩过期内容
+- **Token 计数**：精确估算中英文 Token 数量
+- **权限控制**：四级权限（guest/user/premium/admin），不同限额
+- **成本追踪**：实时记录 Token 使用和费用
+- **降级策略**：根据系统状态自动调整服务级别
+
+#### 3. 请求队列 (requestQueue.ts)
+- 并发控制：同时最多 3 个请求
+- 速率限制：每分钟最多 30 个请求
+- 优先级队列：重要请求优先处理
+- 自动重试：网络错误自动重试（最多 3 次）
+
+#### 4. 异步处理器 (asyncProcessor.ts)
+- 分片处理大数据，避免阻塞 UI
+- 支持任务取消
+- 进度实时报告
+- 并发限制执行
+
 ---
 
 ## 🛠️ 高级配置
@@ -395,6 +486,44 @@ const DEFAULT_CONFIG: ApiClientConfig = {
 
 ```typescript
 const SHORT_TERM_MEMORY_LIMIT = 6;  // 修改这里，建议 4-10 之间
+```
+
+### 配置上下文管理器
+
+在 `src/services/contextManager.ts` 中可以调整：
+
+```typescript
+const DEFAULT_CONFIG: ContextConfig = {
+  maxContextTokens: 4000,          // 最大上下文 Token 数
+  maxHistoryTurns: 10,             // 最多保留 10 轮对话
+  coreMemoryRatio: 0.3,            // 30% 用于核心记忆
+  compressionThreshold: 2000,      // 超过 2000 Token 触发压缩
+  budgetLimit: 10,                 // 每天 $10 预算
+};
+```
+
+### 配置请求队列
+
+在 `src/services/requestQueue.ts` 中可以调整：
+
+```typescript
+const DEFAULT_CONFIG: QueueConfig = {
+  maxConcurrent: 3,           // 同时最多 3 个请求
+  rateLimitPerMinute: 30,     // 每分钟最多 30 个请求
+  retryDelay: 1000,           // 重试延迟 1 秒
+  maxRetries: 3,              // 最大重试次数
+};
+```
+
+### 配置缓存服务
+
+在 `src/services/cacheService.ts` 中可以调整：
+
+```typescript
+const DEFAULT_CONFIG: CacheConfig = {
+  defaultTTL: 1000 * 60 * 60 * 24,  // 24 小时过期
+  maxSize: 50 * 1024 * 1024,        // 最大 50MB
+};
 ```
 
 ### 更换 AI 模型
