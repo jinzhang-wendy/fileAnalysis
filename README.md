@@ -430,11 +430,13 @@ ai-doc-analyzer/
 |------|------|
 | React | 用户界面框架 |
 | TypeScript | 类型安全的 JavaScript |
-| Tailwind CSS | 样式框架 |
+| Ant Design | 企业级 UI 组件库 |
 | React Flow | 流程图渲染 |
+| Monaco Editor | 代码/文本编辑器 |
 | Mammoth | Word 文档解析 |
 | PDF.js | PDF 文档解析 |
 | SheetJS | Excel 文件解析 |
+| LangChain | AI 应用开发框架 |
 | DeepSeek API | AI 智能服务 |
 
 ### 核心服务说明
@@ -558,7 +560,9 @@ const DEFAULT_CONFIG: CacheConfig = {
 
 - [DeepSeek](https://www.deepseek.com/) - 提供强大的 AI 能力
 - [React Flow](https://reactflow.dev/) - 优雅的流程图组件
-- [Tailwind CSS](https://tailwindcss.com/) - 实用的样式框架
+- [Ant Design](https://ant.design/) - 企业级 UI 组件库
+- [LangChain](https://js.langchain.com/) - AI 应用开发框架
+- [Monaco Editor](https://microsoft.github.io/monaco-editor/) - 强大的代码编辑器
 
 ---
 

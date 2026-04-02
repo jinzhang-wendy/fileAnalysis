@@ -17,7 +17,7 @@ interface FlowChartProps {
 }
 
 const FlowChart: React.FC<FlowChartProps> = ({ nodes: initialNodes, edges: initialEdges }) => {
-  const [nodes, , onNodesChange] = useNodesState(initialNodes); // 移除未使用的 setNodes
+  const [nodes, , onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
   const onConnect = useCallback(
@@ -26,7 +26,7 @@ const FlowChart: React.FC<FlowChartProps> = ({ nodes: initialNodes, edges: initi
   );
 
   return (
-    <div style={{ height: 500 }}>
+    <div style={{ height: 400, background: '#fafafa', borderRadius: 8 }}>
       <ReactFlow
         nodes={nodes}
         edges={edges}
